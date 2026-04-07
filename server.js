@@ -1,74 +1,130 @@
-import express from "express";
-import dotenv from "dotenv";
-import { handleIncomingMessage } from "./flows.js";
-
-dotenv.config();
-
+const express = require('express');
 const app = express();
 app.use(express.json());
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+const { handleMessage } = require('./flows');
+const { verifyWebhook, sendMessage } = require('./whatsapp');
+const sessionManager = require('./session');
 
-// ─── Verificação do webhook (Meta exige isso na configuração) ───────────────
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
+// ── In-memory stats store ──────────────────────────────────────────────
+const stats = {
+  totalMessages: 0,
+  humanTakeovers: 0,
+  ordersQueried: 0,
+  startTime: Date.now(),
+  conversations: {},   // phone → { phone, lastMessage, lastSeen, messageCount, status }
+  orderLogs: [],       // { phone, orderId, status, timestamp }
+  serverLogs: [],      // { level, message, timestamp }
+};
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ Webhook verificado com sucesso");
-    return res.status(200).send(challenge);
+function log(level, message) {
+  const entry = { level, message, timestamp: new Date().toISOString() };
+  stats.serverLogs.unshift(entry);
+  if (stats.serverLogs.length > 200) stats.serverLogs.pop();
+  console.log(`[${level.toUpperCase()}] ${message}`);
+}
+
+// ── Webhook verification ───────────────────────────────────────────────
+app.get('/webhook', (req, res) => {
+  const result = verifyWebhook(req.query);
+  if (result.success) {
+    log('info', 'Webhook verified by Meta');
+    return res.status(200).send(result.challenge);
   }
+  log('warn', 'Webhook verification failed');
   res.sendStatus(403);
 });
 
-// ─── Recebe mensagens do WhatsApp ───────────────────────────────────────────
-app.post("/webhook", async (req, res) => {
+// ── Incoming WhatsApp messages ─────────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
   try {
     const body = req.body;
+    if (body.object !== 'whatsapp_business_account') return;
 
-    if (body.object !== "whatsapp_business_account") {
-      return res.sendStatus(404);
+    const entry = body.entry?.[0]?.changes?.[0]?.value;
+    if (!entry?.messages) return;
+
+    const msg = entry.messages[0];
+    const phone = msg.from;
+    const text = msg.text?.body || '';
+
+    // Update conversation stats
+    stats.totalMessages++;
+    if (!stats.conversations[phone]) {
+      stats.conversations[phone] = { phone, messageCount: 0, status: 'bot', lastMessage: '', lastSeen: null };
+    }
+    stats.conversations[phone].messageCount++;
+    stats.conversations[phone].lastMessage = text;
+    stats.conversations[phone].lastSeen = new Date().toISOString();
+
+    log('info', `Message from ${phone}: ${text.substring(0, 60)}`);
+
+    const session = sessionManager.get(phone);
+    const { reply, humanTakeover, orderQueried, orderId } = await handleMessage(phone, text, session);
+
+    if (humanTakeover) {
+      stats.humanTakeovers++;
+      stats.conversations[phone].status = 'human';
+      log('warn', `Human takeover requested by ${phone}`);
     }
 
-    const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-    const messages = value?.messages;
-
-    if (!messages || messages.length === 0) {
-      return res.sendStatus(200); // Sem mensagem (ex: status de entrega)
+    if (orderQueried) {
+      stats.ordersQueried++;
+      stats.orderLogs.unshift({ phone, orderId, timestamp: new Date().toISOString() });
+      if (stats.orderLogs.length > 100) stats.orderLogs.pop();
+      log('info', `Order queried: ${orderId} by ${phone}`);
     }
 
-    const message = messages[0];
-    const from = message.from; // Número do cliente (ex: 5511999999999)
-    const phoneNumberId = value.metadata.phone_number_id;
+    sessionManager.set(phone, session);
+    if (reply) await sendMessage(phone, reply);
 
-    let text = "";
-
-    if (message.type === "text") {
-      text = message.text.body.trim();
-    } else if (message.type === "interactive") {
-      // Resposta de botão ou lista
-      text =
-        message.interactive?.button_reply?.id ||
-        message.interactive?.list_reply?.id ||
-        "";
-    }
-
-    console.log(`📩 Mensagem de ${from}: "${text}"`);
-
-    await handleIncomingMessage({ from, text, phoneNumberId });
-
-    res.sendStatus(200);
   } catch (err) {
-    console.error("❌ Erro no webhook:", err.message);
-    res.sendStatus(500);
+    log('error', `Webhook error: ${err.message}`);
   }
 });
 
-// ─── Health check ───────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.send("🟢 Servidor WhatsApp rodando"));
+// ── Dashboard API ──────────────────────────────────────────────────────
+const DASH_KEY = process.env.DASHBOARD_KEY || 'prata15dash';
 
+function authDash(req, res, next) {
+  const key = req.headers['x-dash-key'] || req.query.key;
+  if (key !== DASH_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+app.get('/dashboard/stats', authDash, (req, res) => {
+  const uptimeMs = Date.now() - stats.startTime;
+  const hours = Math.floor(uptimeMs / 3600000);
+  const minutes = Math.floor((uptimeMs % 3600000) / 60000);
+  res.json({
+    totalMessages: stats.totalMessages,
+    humanTakeovers: stats.humanTakeovers,
+    ordersQueried: stats.ordersQueried,
+    activeConversations: Object.keys(stats.conversations).length,
+    uptime: `${hours}h ${minutes}m`,
+    serverTime: new Date().toISOString(),
+  });
+});
+
+app.get('/dashboard/conversations', authDash, (req, res) => {
+  const list = Object.values(stats.conversations)
+    .sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen))
+    .slice(0, 50);
+  res.json(list);
+});
+
+app.get('/dashboard/orders', authDash, (req, res) => {
+  res.json(stats.orderLogs.slice(0, 50));
+});
+
+app.get('/dashboard/logs', authDash, (req, res) => {
+  res.json(stats.serverLogs.slice(0, 100));
+});
+
+// Health check
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'Prata de 15 Reais Bot' }));
+
+// ── Start ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => log('info', `Server running on port ${PORT}`));
